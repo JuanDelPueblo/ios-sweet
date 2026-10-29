@@ -1,0 +1,35 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..7eaccff 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = ('qcom,kryo470', 'qcom,kryo260');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ce10907..6aaba31 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -154,6 +154,8 @@ sweet_lake_dump_threads(void)
+ 		if (!(th->state & TH_WAIT)) {
+ 			continue;
+ 		}
++		/* Blocked with a continuation: no kernel stack to walk */
++		bool walk = th->continuation == NULL && th->kernel_stack != 0;
+ 		char name[MAXTHREADNAMESIZE] = "";
+ 		thread_get_thread_name(th, name);
+ 		int n = snprintf(line, sizeof(line), "LAKE thread %llu '%s' state 0x%x event 0x%llx cont %p\n",
+@@ -161,7 +163,7 @@ sweet_lake_dump_threads(void)
+ 		sweet_lakelog_append(line, MIN(n, (int)sizeof(line) - 1));
+ 		uint64_t bt[12] = { 0 };
+ 		uint32_t flags = 0;
+-		int frames = machine_trace_thread64(th, (char *)bt, (char *)(bt + 12), 12, &flags);
++		int frames = walk ? machine_trace_thread64(th, (char *)bt, (char *)(bt + 12), 12, &flags) : 0;
+ 		n = 0;
+ 		for (int i = 0; i < frames && i < 12 && n < (int)sizeof(line) - 24; i++) {
+ 			n += snprintf(line + n, sizeof(line) - (size_t)n, " 0x%llx", bt[i]);
