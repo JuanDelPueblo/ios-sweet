@@ -1,0 +1,81 @@
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..1cdb129 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -585,6 +585,17 @@ cpu_idle(void)
+ 		typhoon_prepare_for_wfi();
+ #endif
+ 		__builtin_arm_dsb(DSB_SY);
++#if SWEET_LAKE
++		{
++			/* lake bring-up: GIC/timer state before the first idle WFIs */
++			extern void sweet_lake_gic_probe(const char *tag);
++			static unsigned int lake_idle_probes;
++			if (lake_idle_probes < 4) {
++				lake_idle_probes++;
++				sweet_lake_gic_probe("idle");
++			}
++		}
++#endif
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+ #else
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..5793bca 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -50,6 +50,44 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if SWEET_LAKE
++extern void sweet_lakelog_append(const char *c, int size);
++extern int snprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++static vm_offset_t find_gicr_pe_base(void);
++
++/*
++ * lake bring-up: the timer interrupt never arrived on the first boots.
++ * Record what the GIC and the timer look like into the lakelog (callable
++ * from any context once pe_init_fiq has mapped the GIC).
++ */
++void sweet_lake_gic_probe(const char *tag);
++
++void
++sweet_lake_gic_probe(const char *tag)
++{
++	char line[320];
++
++	if (!gicd_base) {
++		return;
++	}
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	int n = snprintf(line, sizeof(line),
++	    "LAKE GIC %s: mpidr 0x%llx gicr 0x%lx waker 0x%x grp 0x%x en 0x%x pend 0x%x act 0x%x gicd 0x%x | "
++	    "sre 0x%llx grpen1 0x%llx pmr 0x%llx hppi1 0x%llx | daif 0x%llx isr 0x%llx cntv_ctl 0x%llx tval 0x%llx\n",
++	    tag, __builtin_arm_rsr64("MPIDR_EL1"), (unsigned long)gicr_pe_base,
++	    gicr_read32(GICR_WAKER), gicr_read32(GICR_IGROUPR0), gicr_read32(GICR_ISENABLER0),
++	    gicr_read32(GICR_ISENABLER0 + 0x100), gicr_read32(GICR_ISENABLER0 + 0x200),
++	    gicd_read32(GICD_CTLR),
++	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
++	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"),
++	    __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ISR_EL1"),
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), __builtin_arm_rsr64("CNTV_TVAL_EL0"));
++	if (n > 0) {
++		sweet_lakelog_append(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++	}
++}
++#endif /* SWEET_LAKE */
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+@@ -213,6 +251,9 @@ pe_init_fiq()
+ 	}
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
++#if SWEET_LAKE
++	sweet_lake_gic_probe("init");
++#endif
+ #else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
