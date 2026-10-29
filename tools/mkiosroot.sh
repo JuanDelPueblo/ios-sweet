@@ -144,8 +144,10 @@ done
 sudo install -d -m 0700 -o 0 -g 0 "$work/root/private/var/keybags"
 printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
+	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' \
+	> "$work/systembag.kb"	# not /dev/stdin: User-Mode Linux has none
+sudo install -m 0600 -o 0 -g 0 "$work/systembag.kb" "$work/root/private/var/keybags/systembag.kb"
+rm -f "$work/systembag.kb"
 
 df -h "$work/root"
 sudo umount "$work/root"

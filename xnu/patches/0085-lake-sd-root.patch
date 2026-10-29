@@ -1,0 +1,401 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f44e598..b0d00bf 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -118,6 +118,7 @@ static struct {
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
++#if !SWEET_LAKE
+ static inline uint32_t
+ ufs_rd(uint32_t off)
+ {
+@@ -388,6 +389,351 @@ ufs_take_over_host(void)
+ 	return 0;
+ }
+ 
++#else /* SWEET_LAKE */
++/*
++ * lake: the root disk is the microSD card on sdhc_2 (SDHCI 3.0 in a
++ * Qualcomm sdhci-msm v5 wrapper). ABL leaves the controller unclocked but
++ * the card's rails (PM660L L5B/L2B) on, so this clocks it from XO, sets the
++ * pads like Linux, powers the bus with the MSM PWRCTL handshake and runs the
++ * SD identification itself (the same sequence the boot shim's L4 probe ran
++ * on the phone), then moves 4 KiB "device blocks" (8 sectors, so the shared
++ * BSD glue below keeps its UFS_BLOCK arithmetic) by PIO through the bounce
++ * buffer with CMD18/CMD25 and auto CMD12, 4-bit at 19.2 MHz. The partition
++ * is the first MBR entry of type 0xAF (HFS+), p2 on the lake card.
++ */
++#define SD_GCC_PHYS             0x00114000ULL   /* GCC SDCC2 branch and RCG registers */
++#define SD_GCC_APPS_CBCR        0x0004
++#define SD_GCC_AHB_CBCR         0x0008
++#define SD_GCC_CMD_RCGR         0x0010
++#define SD_TLMM_SDC2_PHYS       0x0399b000ULL   /* SDC2 pad drive/pull */
++#define SD_SECTORS              (UFS_BLOCK / 512u)
++
++#define SDHCI_BLK               0x04            /* block size | count << 16 */
++#define SDHCI_ARG               0x08
++#define SDHCI_XFER              0x0c            /* transfer mode | command << 16 */
++#define SDHCI_RESP0             0x10
++#define SDHCI_BUF               0x20
++#define SDHCI_PSTATE            0x24
++#define SDHCI_HOST              0x28
++#define SDHCI_PWR               0x29
++#define SDHCI_CLK               0x2c
++#define SDHCI_TOUT              0x2e
++#define SDHCI_RESET             0x2f
++#define SDHCI_INT               0x30            /* normal | error << 16 */
++#define SDHCI_INT_EN            0x34
++#define MSM_VENDOR_SPEC         0x20c
++#define MSM_PWRCTL_STATUS       0x240
++#define MSM_PWRCTL_CLEAR        0x248
++#define MSM_PWRCTL_CTL          0x24c
++
++#define INT_CMD_DONE            (1u << 0)
++#define INT_XFER_DONE           (1u << 1)
++#define INT_BUF_WR              (1u << 4)
++#define INT_BUF_RD              (1u << 5)
++#define INT_ERR                 (1u << 15)
++
++#define R_NONE                  0x00
++#define R_136                   0x09
++#define R_48                    0x1a
++#define R_48_BUSY               0x1b
++#define R_48_NOCRC              0x02
++#define DATA_PRESENT            0x20
++#define XFER_MULTI_READ         0x36            /* block count, auto CMD12, read, multi */
++#define XFER_MULTI_WRITE        0x26
++
++static vm_offset_t sd_gcc, sd_tlmm;
++
++static inline uint32_t sd_rd32(uint32_t off) { return *(volatile uint32_t *)(su.regs + off); }
++static inline void sd_wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(su.regs + off) = v; }
++static inline void sd_wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(su.regs + off) = v; }
++static inline void sd_wr8(uint32_t off, uint8_t v) { *(volatile uint8_t *)(su.regs + off) = v; }
++static inline uint8_t sd_rd8(uint32_t off) { return *(volatile uint8_t *)(su.regs + off); }
++
++static uint64_t
++sd_deadline(uint64_t us)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(us * NSEC_PER_USEC, &t);
++	return mach_absolute_time() + t;
++}
++
++/* Wait until (reg & mask) == want: 0, or ETIMEDOUT. */
++static int
++sd_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint64_t us)
++{
++	uint64_t end = sd_deadline(us);
++	while ((*(volatile uint32_t *)(base + off) & mask) != want) {
++		if (mach_absolute_time() > end) {
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++/* Linux sdhci_msm_handle_pwr_irq: acknowledge bus and I/O voltage requests. */
++static void
++sd_pwrctl_ack(void)
++{
++	uint32_t st = sd_rd32(MSM_PWRCTL_STATUS), ack = 0;
++	if (!st) {
++		return;
++	}
++	sd_wr32(MSM_PWRCTL_CLEAR, st);
++	if (st & 0x3) {
++		ack |= 1u;              /* BUS_SUCCESS */
++	}
++	if (st & 0xc) {
++		ack |= 1u << 2;         /* IO_SUCCESS */
++	}
++	sd_wr32(MSM_PWRCTL_CTL, ack);
++}
++
++static void
++sd_reset_lines(void)
++{
++	sd_wr8(SDHCI_RESET, 0x06);      /* CMD and DATA lines */
++	(void)sd_wait(su.regs, SDHCI_CLK, 0x06u << 24, 0, 10000);
++}
++
++/* One command; the data phase (if any) is the caller's. 0 or EIO/ETIMEDOUT. */
++static int
++sd_cmd(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t *resp)
++{
++	if (sd_wait(su.regs, SDHCI_PSTATE, (flags & DATA_PRESENT) ? 3 : 1, 0, 100000)) {
++		return ETIMEDOUT;
++	}
++	sd_wr32(SDHCI_INT, 0xffffffff);
++	sd_wr32(SDHCI_ARG, arg);
++	sd_wr32(SDHCI_XFER, mode | (uint32_t)(idx << 8 | flags) << 16);
++	uint64_t end = sd_deadline(100000);
++	uint32_t st;
++	while (!((st = sd_rd32(SDHCI_INT)) & (INT_CMD_DONE | INT_ERR))) {
++		if (mach_absolute_time() > end) {
++			sd_reset_lines();
++			return ETIMEDOUT;
++		}
++	}
++	if (st & INT_ERR) {
++		printf("LAKE SD: CMD%u arg 0x%x error 0x%x\n", idx, arg, st >> 16);
++		sd_reset_lines();
++		return EIO;
++	}
++	sd_wr32(SDHCI_INT, INT_CMD_DONE);
++	if (resp) {
++		for (int i = 0; i < 4; i++) {
++			resp[i] = sd_rd32(SDHCI_RESP0 + 4 * i);
++		}
++	}
++	return 0;
++}
++
++/* Multi-block PIO transfer of nsect sectors at sector to/from the bounce buffer. */
++static int
++sd_xfer(uint64_t sector, uint32_t nsect, bool write)
++{
++	uint32_t *buf = (uint32_t *)(su.dma + DMA_BOUNCE);
++	if (sector > UINT32_MAX || nsect == 0 || nsect > 0xffff || nsect * 512ull > BOUNCE_SIZE) {
++		return EINVAL;
++	}
++	sd_wr32(SDHCI_BLK, 512 | nsect << 16);
++	int error = sd_cmd(write ? 25 : 18, (uint32_t)sector, R_48 | DATA_PRESENT,
++	    write ? XFER_MULTI_WRITE : XFER_MULTI_READ, NULL);
++	if (error) {
++		return error;
++	}
++	uint32_t ready = write ? INT_BUF_WR : INT_BUF_RD;
++	for (uint32_t b = 0; b < nsect; b++) {
++		uint64_t end = sd_deadline(1000000);
++		uint32_t st;
++		while (!((st = sd_rd32(SDHCI_INT)) & (ready | INT_ERR))) {
++			if (mach_absolute_time() > end) {
++				printf("LAKE SD: %s timeout at block %u of %u (sector 0x%llx)\n",
++				    write ? "write" : "read", b, nsect, sector);
++				sd_reset_lines();
++				return ETIMEDOUT;
++			}
++		}
++		if (st & INT_ERR) {
++			printf("LAKE SD: %s error 0x%x at block %u (sector 0x%llx)\n",
++			    write ? "write" : "read", st >> 16, b, sector);
++			sd_reset_lines();
++			return EIO;
++		}
++		sd_wr32(SDHCI_INT, ready);
++		uint32_t *p = buf + b * 128;
++		if (write) {
++			for (int i = 0; i < 128; i++) {
++				sd_wr32(SDHCI_BUF, p[i]);
++			}
++		} else {
++			for (int i = 0; i < 128; i++) {
++				p[i] = sd_rd32(SDHCI_BUF);
++			}
++		}
++	}
++	/* Transfer complete also covers auto CMD12 and the card's write busy. */
++	uint64_t end = sd_deadline(2000000);
++	uint32_t st;
++	while (!((st = sd_rd32(SDHCI_INT)) & (INT_XFER_DONE | INT_ERR))) {
++		if (mach_absolute_time() > end) {
++			sd_reset_lines();
++			return ETIMEDOUT;
++		}
++	}
++	if (st & INT_ERR) {
++		printf("LAKE SD: %s end error 0x%x (sector 0x%llx)\n", write ? "write" : "read",
++		    st >> 16, sector);
++		sd_reset_lines();
++		return EIO;
++	}
++	return 0;
++}
++
++/* Read count device blocks at lba into the bounce buffer. */
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	return sd_xfer(lba * SD_SECTORS, count * SD_SECTORS, false);
++}
++
++/*
++ * Write count device blocks from the bounce buffer to lba. The range must
++ * lie inside the partition: this is the only place data goes out.
++ */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
++	    count > su.nblocks - (lba - su.first_block)) {
++		printf("LAKE SD: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	return sd_xfer(lba * SD_SECTORS, count * SD_SECTORS, true);
++}
++
++/* Every write already waited for the card's busy (transfer complete). */
++static int
++ufs_sync_cache(void)
++{
++	return 0;
++}
++
++/* The first MBR partition of type 0xAF (HFS+); 4 KiB aligned. */
++static int
++ufs_find_partition(__unused const char *want)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(0, 1);
++	if (error) {
++		return error;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa) {
++		printf("LAKE SD: no MBR on the card\n");
++		return ENXIO;
++	}
++	for (int i = 0; i < 4; i++) {
++		const uint8_t *e = b + 446 + 16 * i;
++		uint32_t first, count;
++		memcpy(&first, e + 8, 4);
++		memcpy(&count, e + 12, 4);
++		if (e[4] != 0xaf) {
++			continue;
++		}
++		if ((first | count) % SD_SECTORS || count == 0) {
++			printf("LAKE SD: partition %d (0x%x + 0x%x) not 4 KiB aligned\n", i + 1, first, count);
++			return ENXIO;
++		}
++		su.first_block = first / SD_SECTORS;
++		su.nblocks = count / SD_SECTORS;
++		printf("LAKE SD: HFS+ partition %d at sector 0x%x, %u MiB\n", i + 1, first, count >> 11);
++		return 0;
++	}
++	printf("LAKE SD: no MBR partition of type 0xAF\n");
++	return ENOENT;
++}
++
++/* Clocks, pads, power and the SD identification sequence: 0 with the card selected. */
++static int
++ufs_take_over_host(void)
++{
++	uint32_t r[4] = { 0 };
++	int error;
++
++	sd_gcc = ml_io_map(SD_GCC_PHYS, PAGE_SIZE);
++	sd_tlmm = ml_io_map(SD_TLMM_SDC2_PHYS, PAGE_SIZE);
++	/* AHB branch, apps RCG from XO (CFG 0: source XO, no divider), apps branch */
++	*(volatile uint32_t *)(sd_gcc + SD_GCC_AHB_CBCR) |= 1;
++	*(volatile uint32_t *)(sd_gcc + SD_GCC_CMD_RCGR + 4) = 0;
++	*(volatile uint32_t *)(sd_gcc + SD_GCC_CMD_RCGR) |= 1;
++	(void)sd_wait(sd_gcc, SD_GCC_CMD_RCGR, 1, 0, 10000);
++	*(volatile uint32_t *)(sd_gcc + SD_GCC_APPS_CBCR) |= 1;
++	if (sd_wait(sd_gcc, SD_GCC_APPS_CBCR, 1u << 31, 0, 10000) ||
++	    sd_wait(sd_gcc, SD_GCC_AHB_CBCR, 1u << 31, 0, 10000)) {
++		printf("LAKE SD: SDCC2 clocks stay off\n");
++		return ENXIO;
++	}
++	/* Pads as Linux sdc2_state_on: clk 16 mA no pull, cmd/data 10 mA pull-up */
++	*(volatile uint32_t *)sd_tlmm = 7u << 6 | 3u << 11 | 4u << 3 | 3u << 9 | 4u;
++
++	sd_wr8(SDHCI_RESET, 1);
++	delay(1000);
++	sd_wr32(MSM_VENDOR_SPEC, 0xa9c);        /* CORE_VENDOR_SPEC_POR_VAL */
++	sd_pwrctl_ack();
++	sd_wr32(SDHCI_INT_EN, 0xffffffff);      /* status bits latch, no interrupts */
++	sd_wr8(SDHCI_PWR, 0x0f);                /* 3.3 V, bus power on */
++	delay(1000);
++	sd_pwrctl_ack();
++	delay(1000);
++	sd_pwrctl_ack();
++	sd_wr8(SDHCI_TOUT, 0x0e);
++	sd_wr16(SDHCI_CLK, 24 << 8 | 1);        /* 19.2 MHz / 48 = 400 kHz */
++	(void)sd_wait(su.regs, SDHCI_CLK, 2, 2, 10000);
++	sd_wr16(SDHCI_CLK, 24 << 8 | 1 | 4);
++	delay(2000);
++
++	(void)sd_cmd(0, 0, R_NONE, 0, NULL);
++	delay(1000);
++	if ((error = sd_cmd(8, 0x1aa, R_48, 0, r)) || (r[0] & 0xfff) != 0x1aa) {
++		printf("LAKE SD: no answer to CMD8 (%d, 0x%x): no card or no power\n", error, r[0]);
++		return ENXIO;
++	}
++	uint32_t ocr = 0;
++	for (int i = 0; i < 200 && !(ocr & 0x80000000u); i++) {
++		if (sd_cmd(55, 0, R_48, 0, NULL) || sd_cmd(41, 0x40ff8000, R_48_NOCRC, 0, r)) {
++			break;
++		}
++		ocr = r[0];
++		delay(10000);
++	}
++	if (!(ocr & 0x80000000u) || !(ocr & 0x40000000u)) {
++		printf("LAKE SD: card not ready or not SDHC/SDXC (OCR 0x%x)\n", ocr);
++		return ENXIO;
++	}
++	if ((error = sd_cmd(2, 0, R_136, 0, r)) || (error = sd_cmd(3, 0, R_48, 0, r))) {
++		return error;
++	}
++	uint32_t rca = r[0] >> 16;
++	if ((error = sd_cmd(7, rca << 16, R_48_BUSY, 0, r))) {
++		return error;
++	}
++	/* 4-bit bus (ACMD6), then the controller's full 19.2 MHz (divider 0) */
++	if ((error = sd_cmd(55, rca << 16, R_48, 0, NULL)) || (error = sd_cmd(6, 2, R_48, 0, r))) {
++		return error;
++	}
++	sd_wr8(SDHCI_HOST, (uint8_t)(sd_rd8(SDHCI_HOST) | 0x02));
++	sd_wr16(SDHCI_CLK, 1);
++	(void)sd_wait(su.regs, SDHCI_CLK, 2, 2, 10000);
++	sd_wr16(SDHCI_CLK, 1 | 4);
++	delay(1000);
++	printf("LAKE SD: card RCA 0x%x OCR 0x%x, 4-bit at 19.2 MHz, PIO\n", rca, ocr);
++	return 0;
++}
++#endif /* SWEET_LAKE */
++
+ static int
+ sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+ {
+@@ -624,12 +970,14 @@ sweet_ufs_init(void)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++#if !SWEET_LAKE
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
++#endif
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
+@@ -655,12 +1003,21 @@ sweet_ufs_init(void)
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++#if SWEET_LAKE
++	/*
++	 * No sweetlog: on lake the HFS+ volume fills the partition, whose last
++	 * 4 MiB hold its alternate volume header (the RAM lakelog has the
++	 * console). The keys, touch and USB drivers are sweet's hardware.
++	 */
++	sweet_sample_start();
++#else
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++#endif
+ 	return 0;
+ }
+ 

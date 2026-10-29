@@ -46,6 +46,9 @@ LAKE_GICR = 0x17b00000
 LAKE_FB, LAKE_FB_SIZE = 0x9d400000, 0x960000
 LAKE_FB_H = 2270
 LAKE_ECID = 0x4c414b4500000001  # 'LAKE' + 1, synthetic
+# microSD host sdhc_2 (mmc@c084000): with SWEET_LAKE, bsd/dev/sweet_ufs.c
+# drives it through the same /sweet-ufs node (root on its 0xAF partition)
+LAKE_SDHC, LAKE_SDHC_SIZE = 0x0c084000, 0x1000
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
@@ -236,11 +239,12 @@ def build(seed=None, qemu=False, highmem=False, lake=False):
         ('stride', u32(FB_STRIDE)),
     ])
 
-    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg);
+    # on lake the microSD host, same driver file.
     ufs = node('sweet-ufs', [
         ph(),
-        ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('compatible', cstr('qcom,sdhci-msm-v5') if lake else cstr('qcom,ufshc')),
+        ('reg', u64(LAKE_SDHC, LAKE_SDHC_SIZE) if lake else u64(UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -279,7 +283,7 @@ def build(seed=None, qemu=False, highmem=False, lake=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or lake else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
