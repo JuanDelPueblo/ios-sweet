@@ -1,0 +1,151 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b0d00bf..87ad6e8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1045,9 +1045,6 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+-#if SWEET_LAKE
+-void sweet_lakelog_append(const char *c, int size);     /* osfmk/arm64/sweet_early.c */
+-#endif
+ 
+ void
+ sweet_log_append(const char *c, int size)
+@@ -1059,9 +1056,6 @@ sweet_log_append(const char *c, int size)
+ 	for (int i = 0; i < size; i++) {
+ 		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+ 	}
+-#if SWEET_LAKE
+-	sweet_lakelog_append(c, size);
+-#endif
+ }
+ 
+ /*
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index fc99046..a26a57c 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -127,12 +127,31 @@ sweet_lake_wdt_init(void)
+ 	printf("SWEET LAKE: watchdog petted from the timer interrupt for %u s\n", max_s);
+ }
+ 
++/*
++ * Also a heartbeat in the lakelog every 5 s (straight into the log, any
++ * context): it shows whether timer interrupts still arrive after the last
++ * console line.
++ */
+ void
+ sweet_lake_wdt_pet(void)
+ {
+-	if (lake_wdt_rst != NULL && mach_absolute_time() < lake_wdt_until) {
++	static uint64_t next_beat;
++	uint64_t now = mach_absolute_time();
++
++	if (lake_wdt_rst != NULL && now < lake_wdt_until) {
+ 		*lake_wdt_rst = 1;
+ 	}
++	if (now >= next_beat) {
++		uint64_t s = now / 19200000ULL;
++		char line[] = "LAKE beat 0000s cpuN\n";
++		line[10] = (char)('0' + (s / 1000) % 10);
++		line[11] = (char)('0' + (s / 100) % 10);
++		line[12] = (char)('0' + (s / 10) % 10);
++		line[13] = (char)('0' + s % 10);
++		line[18] = (char)('0' + (__builtin_arm_rsr64("MPIDR_EL1") & 0xf));
++		sweet_lakelog_append(line, (int)sizeof(line) - 1);
++		next_beat = now + 5 * 19200000ULL;
++	}
+ }
+ 
+ /*
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..3cea105 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -50,6 +50,9 @@
+ #if __arm64__
+ #include <machine/machine_routines.h>
+ #include <arm/cpu_data_internal.h>
++#if defined(__arm64__)
++#include <arm64/sweet_early.h>  /* SWEET_LAKE lakelog */
++#endif
+ #endif
+ 
+ #ifdef CONFIG_XNUPOST
+@@ -275,6 +278,10 @@ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c *
+  */
+ int sweet_console_muted;
+ #endif
++#if SWEET_LAKE
++/* > 0 while _cnputs prints text console_write already put into the lakelog */
++static int sweet_lakelog_skip;
++#endif
+ 
+ static inline void
+ _cnputs(char *c, int size, bool poll)
+@@ -283,6 +290,11 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++#if SWEET_LAKE
++	if (!sweet_lakelog_skip) {      /* panics and other direct output */
++		sweet_lakelog_append(c, size);
++	}
++#endif
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
+@@ -465,7 +477,13 @@ console_ring_try_empty(bool fail_fast)
+ 		 */
+ 		if (nchars_out > 0) {
+ 			total_chars_out += nchars_out;
++#if SWEET_LAKE
++			sweet_lakelog_skip++;
++#endif
+ 			_cnputs(flush_buf, nchars_out, console_suspended);
++#if SWEET_LAKE
++			sweet_lakelog_skip--;
++#endif
+ 		}
+ 
+ 		if (__probable(!in_debugger)) {
+@@ -530,6 +548,14 @@ void
+ console_write(char *str, int size)
+ {
+ 	assert(str != NULL);
++#if SWEET_LAKE
++	/*
++	 * Into the lakelog before the console ring: the ring is only drained
++	 * with preemption enabled, so text queued just before a hang never
++	 * reached _cnputs.
++	 */
++	sweet_lakelog_append(str, size);
++#endif
+ 
+ 	char *write_ptr = NULL;
+ 	int chunk_size = CPU_CONS_BUF_SIZE;
+@@ -547,7 +573,13 @@ console_write(char *str, int size)
+ 		 *    mutex and preemption is disabled in the PPL, any writes must go
+ 		 *    directly to the hardware device.
+ 		 */
++#if SWEET_LAKE
++		sweet_lakelog_skip++;
++#endif
+ 		_cnputs(str, size, true);
++#if SWEET_LAKE
++		sweet_lakelog_skip--;
++#endif
+ 		return;
+ 	} else if (__improbable(!console_io_allowed())) {
+ 		return;
+@@ -607,6 +639,9 @@ console_write(char *str, int size)
+ void
+ console_write_unbuffered(char c)
+ {
++#if SWEET_LAKE
++	sweet_lakelog_append(&c, 1);
++#endif
+ 	_cnputc(c, true);
+ }
+ 
