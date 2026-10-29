@@ -8,7 +8,7 @@ CC="clang --target=aarch64-none-elf"
 # -fno-jump-tables: clang otherwise turns switches into tables of absolute pointers
 CFLAGS="${EXTRA_CFLAGS:-} -O2 -fno-jump-tables -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 OUT=out-lake
-SRCS="start.S lake.c console.c lakelog.c spmi.c sdhc.c mmu.c fdt.c loader.c"
+SRCS="start.S lake.c console.c lakelog.c spmi.c sdhc.c touch.c mmu.c fdt.c loader.c"
 mkdir -p $OUT
 objs=()
 for f in $SRCS; do

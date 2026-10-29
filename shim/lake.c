@@ -18,6 +18,7 @@
 #include "mmu.h"
 #include "sdhc.h"
 #include "spmi.h"
+#include "touch.h"
 
 #define PSHOLD			0x010ac000UL
 #define GCC_BASE		0x00100000UL
@@ -394,6 +395,9 @@ static void gold_main(void)
 	test_gic();
 	test_sdhc();
 	test_mmu();
+	stage = "touch";
+	con_clear(BLUE);
+	test_touch(25);
 
 	stage = "done";
 	con_str("DONE", "milestone L2");
