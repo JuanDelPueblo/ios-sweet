@@ -1,0 +1,64 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index dd5cd17..56e420a 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1871,7 +1871,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ #if SWEET_LAKE
+-		sweet_lake_wdt_pet();
++		sweet_lake_wdt_pet(get_saved_state_pc(state), get_saved_state_lr(state));
+ #endif
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index a26a57c..8f858e4 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -132,8 +132,11 @@ sweet_lake_wdt_init(void)
+  * context): it shows whether timer interrupts still arrive after the last
+  * console line.
+  */
++extern int snprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++
++/* pc/lr: where the timer interrupt found the CPU (symbolize offline). */
+ void
+-sweet_lake_wdt_pet(void)
++sweet_lake_wdt_pet(uint64_t pc, uint64_t lr)
+ {
+ 	static uint64_t next_beat;
+ 	uint64_t now = mach_absolute_time();
+@@ -142,14 +145,12 @@ sweet_lake_wdt_pet(void)
+ 		*lake_wdt_rst = 1;
+ 	}
+ 	if (now >= next_beat) {
+-		uint64_t s = now / 19200000ULL;
+-		char line[] = "LAKE beat 0000s cpuN\n";
+-		line[10] = (char)('0' + (s / 1000) % 10);
+-		line[11] = (char)('0' + (s / 100) % 10);
+-		line[12] = (char)('0' + (s / 10) % 10);
+-		line[13] = (char)('0' + s % 10);
+-		line[18] = (char)('0' + (__builtin_arm_rsr64("MPIDR_EL1") & 0xf));
+-		sweet_lakelog_append(line, (int)sizeof(line) - 1);
++		char line[96];
++		int n = snprintf(line, sizeof(line), "LAKE beat %llus cpu%llu pc 0x%llx lr 0x%llx\n",
++		    now / 19200000ULL, __builtin_arm_rsr64("MPIDR_EL1") & 0xf, pc, lr);
++		if (n > 0) {
++			sweet_lakelog_append(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		}
+ 		next_beat = now + 5 * 19200000ULL;
+ 	}
+ }
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index e3a8902..6ef68c4 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -17,7 +17,7 @@ void sweet_early_disable(void);
+ void sweet_lakelog_append(const char *c, int size);
+ void sweet_lake_reset(bool panicking) __dead2;
+ void sweet_lake_wdt_init(void);
+-void sweet_lake_wdt_pet(void);
++void sweet_lake_wdt_pet(uint64_t pc, uint64_t lr);
+ #endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
