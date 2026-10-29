@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index df73add..b06167b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -495,10 +495,34 @@ sd_reset_lines(void)
+ 	(void)sd_wait(su.regs, SDHCI_CLK, 0x06u << 24, 0, 10000);
+ }
+ 
+-/* One command; the data phase (if any) is the caller's. 0 or EIO/ETIMEDOUT. */
++/*
++ * Microseconds to leave between a command's end and the next one: the SD
++ * N_RC minimum is 8 bus clocks, 20 us at 400 kHz. With caches on, xnu
++ * reissues within a microsecond and the controller silently drops the
++ * command (no completion, no timeout error); the uncached boot shim never
++ * hit that. 2 us once the bus runs at 19.2 MHz.
++ */
++static uint32_t sd_gap_us = 25;
++
++static int sd_cmd_once(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t *resp);
++
++/* One command (retried once if the controller dropped it); the data phase is the caller's. */
+ static int
+ sd_cmd(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t *resp)
+ {
++	int error = sd_cmd_once(idx, arg, flags, mode, resp);
++	if (error == ETIMEDOUT && !(flags & DATA_PRESENT)) {
++		delay(1000);
++		error = sd_cmd_once(idx, arg, flags, mode, resp);
++		printf("LAKE SD: CMD%u retried: %d\n", idx, error);
++	}
++	return error;
++}
++
++static int
++sd_cmd_once(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t *resp)
++{
++	delay(sd_gap_us);
+ 	if (sd_wait(su.regs, SDHCI_PSTATE, (flags & DATA_PRESENT) ? 3 : 1, 0, 100000)) {
+ 		printf("LAKE SD: CMD%u: lines busy, pstate 0x%x\n", idx, sd_rd32(SDHCI_PSTATE));
+ 		sd_reset_lines();
+@@ -528,6 +552,18 @@ sd_cmd(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t *resp
+ 			resp[i] = sd_rd32(SDHCI_RESP0 + 4 * i);
+ 		}
+ 	}
++	if (flags == R_48_BUSY) {
++		/* R1b: transfer complete marks the end of the card's busy on DAT0 */
++		end = sd_deadline(1000000);
++		while (!((st = sd_rd32(SDHCI_INT)) & (INT_XFER_DONE | INT_ERR))) {
++			if (mach_absolute_time() > end) {
++				printf("LAKE SD: CMD%u busy did not end, pstate 0x%x\n", idx, sd_rd32(SDHCI_PSTATE));
++				sd_reset_lines();
++				return ETIMEDOUT;
++			}
++		}
++		sd_wr32(SDHCI_INT, INT_XFER_DONE | (st & 0xffff0000u));
++	}
+ 	return 0;
+ }
+ 
+@@ -707,6 +743,7 @@ sd_identify(int attempt)
+ 	uint32_t r[4] = { 0 };
+ 	int error;
+ 
++	sd_gap_us = 25;
+ 	sd_wr8(SDHCI_RESET, 1);
+ 	delay(1000);
+ 	sd_wr32(MSM_VENDOR_SPEC, 0xa9c);        /* CORE_VENDOR_SPEC_POR_VAL */
+@@ -766,6 +803,7 @@ sd_identify(int attempt)
+ 	(void)sd_wait(su.regs, SDHCI_CLK, 2, 2, 10000);
+ 	sd_wr16(SDHCI_CLK, 1 | 4);
+ 	delay(1000);
++	sd_gap_us = 2;
+ 	printf("LAKE SD: card RCA 0x%x OCR 0x%x, 4-bit at 19.2 MHz, PIO\n", rca, ocr);
+ 	return 0;
+ }

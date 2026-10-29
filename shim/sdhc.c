@@ -32,6 +32,7 @@
 #define SDHCI_RESP0		0x10
 #define SDHCI_BUF		0x20
 #define SDHCI_PSTATE		0x24
+#define SDHCI_HOST		0x28
 #define SDHCI_PWR		0x29
 #define SDHCI_CLK		0x2c
 #define SDHCI_TOUT		0x2e
@@ -224,10 +225,59 @@ void test_sdhc(void)
 	con_hex2("CMD3", "rc=", rc, "rca=", rca);
 	rc = cmd(7, rca << 16, R_48 | 1, r);	/* R1b */
 	con_hex2("CMD7", "rc=", rc, "r1=", r[0]);
+#ifdef SD_R1B_NOW
+	/* xnu's order: ACMD6 straight after CMD7's busy response */
+	int n55 = cmd(55, rca << 16, R_48, 0);
+	int n6 = n55 ? 0 : cmd(6, 2, R_48, r);
+	con_hex2("ACMD6 now", "rc55=", (uint32_t)n55, "rc6=", (uint32_t)n6);
+	con_hex2(" st", "int=", rd32(HC + SDHCI_INT), "pstate=", rd32(HC + SDHCI_PSTATE));
+#endif
 
 	rc = read_block(0, mbr);
 	const uint8_t *b = (const uint8_t *)mbr;
 	con_hex2("MBR", "rc=", rc, "sig=", (uint32_t)b[510] << 8 | b[511]);
 	con_hex2(" types", "p1p2=", (uint32_t)b[0x1c2] << 8 | b[0x1d2], "p3=", b[0x1e2]);
 	con_hex2(" p2", "lba=", mbr[0x1d6 / 4] >> 16 | mbr[0x1da / 4] << 16, 0, 0);
+#ifdef SD_FAST
+	/* What xnu does next: ACMD6 (4-bit bus), 19.2 MHz, one 8-sector CMD18 */
+	uint32_t p2 = mbr[0x1d6 / 4] >> 16 | mbr[0x1da / 4] << 16;
+	int rc55 = cmd(55, rca << 16, R_48, 0);
+	int rc6 = rc55 ? 0 : cmd(6, 2, R_48, r);
+	con_hex2("ACMD6", "rc55=", (uint32_t)rc55, "rc6=", (uint32_t)rc6);
+	con_hex2(" st", "int=", rd32(HC + SDHCI_INT), "pstate=", rd32(HC + SDHCI_PSTATE));
+	if (rc55 || rc6)
+		return;
+	wr8(HC + SDHCI_HOST, rd8(HC + SDHCI_HOST) | 0x02);
+	wr16(HC + SDHCI_CLK, 1);
+	poll32(HC + SDHCI_CLK & ~3UL, 2, 2, 10000);
+	wr16(HC + SDHCI_CLK, 1 | 4);
+	udelay(1000);
+	wr32(HC + SDHCI_BLK, 512 | 8U << 16);
+	if (poll32(HC + SDHCI_PSTATE, 3, 0, 10000)) {
+		con_hex("CMD18 busy", rd32(HC + SDHCI_PSTATE));
+		return;
+	}
+	wr32(HC + SDHCI_INT, 0xffffffff);
+	wr32(HC + SDHCI_ARG, p2 + 2);		/* the HFS+ volume header sector */
+	wr32(HC + SDHCI_XFER, 0x36 | (18U << 8 | R_48 | DATA_PRESENT) << 16);
+	uint32_t first = 0, st = 0;
+	for (int b = 0; b < 8; b++) {
+		uint64_t end = ticks() + 192000 * 100;
+		while (!((st = rd32(HC + SDHCI_INT)) & (INT_BUF_RD | INT_ERR)))
+			if (ticks() > end)
+				break;
+		if (!(st & INT_BUF_RD)) {
+			con_hex2("CMD18", "block=", b, "int=", st);
+			return;
+		}
+		wr32(HC + SDHCI_INT, INT_BUF_RD);
+		for (int i = 0; i < 128; i++) {
+			uint32_t v = rd32(HC + SDHCI_BUF);
+			if (b == 0 && i == 0)
+				first = v;
+		}
+	}
+	int done = poll32(HC + SDHCI_INT, INT_XFER_DONE, INT_XFER_DONE, 100000);
+	con_hex2("CMD18", "hfs=", __builtin_bswap32(first), "done/int=", (uint32_t)done << 31 | rd32(HC + SDHCI_INT));
+#endif
 }

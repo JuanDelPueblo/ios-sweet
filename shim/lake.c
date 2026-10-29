@@ -393,6 +393,10 @@ static void gold_main(void)
 
 	test_smp();
 	test_gic();
+#ifdef SD_LATE
+	con_hex("SD LATE wait s", SD_LATE);
+	delay_ms(SD_LATE * 1000);
+#endif
 	test_sdhc();
 	test_mmu();
 	stage = "touch";
