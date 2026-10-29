@@ -1,0 +1,69 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 8f858e4..ce10907 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -15,6 +15,8 @@
+ #if SWEET_LAKE
+ #include <arm/machine_routines.h>
+ #include <mach/mach_time.h>
++#include <kern/thread.h>
++#include <kern/queue.h>
+ #endif
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PHYS;
+@@ -133,6 +135,43 @@ sweet_lake_wdt_init(void)
+  * console line.
+  */
+ extern int snprintf(char *, size_t, const char *, ...) __printflike(3, 4);
++extern queue_head_t threads;                    /* kern/processor.c */
++extern int machine_trace_thread64(thread_t thread, char *tracepos, char *tracebound,
++    int nframes, uint32_t *thread_trace_flags);   /* kdp/ml/arm/kdp_machdep.c */
++
++/*
++ * lake bring-up: once, from the timer interrupt (one CPU, so nothing moves
++ * underneath), every waiting thread with its wait event, continuation and
++ * kernel backtrace (return addresses, symbolize offline).
++ */
++static void
++sweet_lake_dump_threads(void)
++{
++	char line[256];
++	thread_t th;
++
++	queue_iterate(&threads, th, thread_t, threads) {
++		if (!(th->state & TH_WAIT)) {
++			continue;
++		}
++		char name[MAXTHREADNAMESIZE] = "";
++		thread_get_thread_name(th, name);
++		int n = snprintf(line, sizeof(line), "LAKE thread %llu '%s' state 0x%x event 0x%llx cont %p\n",
++		    th->thread_id, name, th->state, (uint64_t)th->wait_event, (void *)th->continuation);
++		sweet_lakelog_append(line, MIN(n, (int)sizeof(line) - 1));
++		uint64_t bt[12] = { 0 };
++		uint32_t flags = 0;
++		int frames = machine_trace_thread64(th, (char *)bt, (char *)(bt + 12), 12, &flags);
++		n = 0;
++		for (int i = 0; i < frames && i < 12 && n < (int)sizeof(line) - 24; i++) {
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " 0x%llx", bt[i]);
++		}
++		if (n > 0) {
++			line[n++] = '\n';
++			sweet_lakelog_append(line, n);
++		}
++	}
++}
+ 
+ /* pc/lr: where the timer interrupt found the CPU (symbolize offline). */
+ void
+@@ -152,6 +191,11 @@ sweet_lake_wdt_pet(uint64_t pc, uint64_t lr)
+ 			sweet_lakelog_append(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+ 		}
+ 		next_beat = now + 5 * 19200000ULL;
++		static bool dumped;
++		if (!dumped && now > 60 * 19200000ULL) {
++			dumped = true;
++			sweet_lake_dump_threads();
++		}
+ 	}
+ }
+ 
