@@ -1,0 +1,411 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..f44e598 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -37,6 +37,7 @@
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <pexpert/arm64/board_config.h>     /* SWEET_LAKE */
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ 
+@@ -687,6 +688,9 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
++#if SWEET_LAKE
++void sweet_lakelog_append(const char *c, int size);     /* osfmk/arm64/sweet_early.c */
++#endif
+ 
+ void
+ sweet_log_append(const char *c, int size)
+@@ -698,6 +702,9 @@ sweet_log_append(const char *c, int size)
+ 	for (int i = 0; i < size; i++) {
+ 		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+ 	}
++#if SWEET_LAKE
++	sweet_lakelog_append(c, size);
++#endif
+ }
+ 
+ /*
+diff --git a/config/MASTER.arm64.sweet b/config/MASTER.arm64.sweet
+index e305f0d..e63bd31 100644
+--- a/config/MASTER.arm64.sweet
++++ b/config/MASTER.arm64.sweet
+@@ -69,7 +69,7 @@
+ #else
+ #  PARAVIRT_BASE =  [ ]
+ #endif /*SOC_IS_VIRTUALIZED*/
+-#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE config_ledger_interval_max ]
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE config_ledger_interval_max ]
+ #  MACH_RELEASE =   [ MACH_BASE ]
+ #  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
+ #  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug ]
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..9a6a78e 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,16 +73,26 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if SWEET_LAKE
++	/* MPIDR Aff1 = cluster, Aff0 = core: the gold A73s are 0x100-0x103 */
++	if ((cpu->phys_id & ~0x3u) != 0x100 ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#endif
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++#if SWEET_LAKE
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 260");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -144,9 +154,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+-		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
++	/* The supplied ADT has cpu0 as the boot CPU and ascending core nodes. */
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != SWEET_BOOT_MPIDR) {
++		panic("SWEET CPU: expected boot MPIDR 0x%x and logical CPU 0", SWEET_BOOT_MPIDR);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..196a66b 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -61,7 +61,8 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# lake (SWEET_LAKE in SWEET.h): Kryo 260 is ARMv8.0, no LSE atomics, no PAN
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crc+crypto
+ 
+ 
+ #
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..4202627 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (tt_entry_t)SWEET_FB_BLOCK | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..f074c6b 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,10 +515,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_FB_PHYS + (SWEET_FB_HEIGHT - 32) * SWEET_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #SWEET_FB_STRIDE
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -686,7 +686,7 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_FB_BLOCK
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..3ed0274 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,5 +1,5 @@
+ /*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
++ * Redmi Note 10 Pro / Moto G7 Plus bootstrap console. No allocation, locks, ADT parsing or
+  * per-CPU state: panic() can reach this before a current thread exists.
+  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+  * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+@@ -10,12 +10,14 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <machine/atomic.h>
++#include <pexpert/pexpert.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PHYS;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH ((unsigned int)SWEET_FB_WIDTH)
++#define EARLY_HEIGHT ((unsigned int)SWEET_FB_HEIGHT)
++#define EARLY_STRIDE ((unsigned int)SWEET_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -39,12 +41,108 @@ sweet_early_clear_row(void)
+ 	}
+ }
+ 
++#if SWEET_LAKE
++/*
++ * lakelog (SWEET.h): "LAKELOG1" | u32 boots | u32 len | u64 pad | text.
++ * The boot shim starts it and XNU appends to it, through the same VA=PA
++ * and then alias mappings as the early console. They are Normal-NC, so the
++ * text reaches DRAM without cache maintenance and survives the reset into
++ * fastboot; tools/lake-log.py reads it back from Linux.
++ */
++struct lakelog_header {
++	char magic[8];
++	uint32_t boots, len;
++	uint64_t pad;
++};
++#define LAKELOG_CAP ((uint32_t)(SWEET_LAKELOG_SIZE - sizeof(struct lakelog_header)))
++
++static volatile struct lakelog_header *lake_log =
++    (volatile struct lakelog_header *)(uintptr_t)SWEET_LAKELOG_PHYS;
++static uint32_t lake_log_state;         /* 0 unchecked, 1 checking, 2 on */
++static uint32_t lake_log_len;
++
++void
++sweet_lakelog_append(const char *c, int size)
++{
++	static const char magic[8] = { 'L', 'A', 'K', 'E', 'L', 'O', 'G', '1' };
++	uint32_t state = os_atomic_load(&lake_log_state, acquire);
++
++	if (state == 0 && os_atomic_cmpxchg(&lake_log_state, 0, 1, acquire)) {
++		bool ok = true;
++		for (int i = 0; i < 8; i++) {
++			ok &= lake_log->magic[i] == magic[i];
++		}
++		if (!ok) {      /* booted without the shim's log: start one */
++			for (int i = 0; i < 8; i++) {
++				lake_log->magic[i] = magic[i];
++			}
++			lake_log->boots = 1;
++			lake_log->len = 0;
++		}
++		lake_log_len = MIN(lake_log->len, LAKELOG_CAP);
++		os_atomic_store(&lake_log_state, 2, release);
++		state = 2;
++	}
++	if (state != 2 || size <= 0) {
++		return;
++	}
++	uint32_t at = os_atomic_add_orig(&lake_log_len, (uint32_t)size, relaxed);
++	volatile char *text = (volatile char *)(lake_log + 1);
++	for (int i = 0; i < size && at + (uint32_t)i < LAKELOG_CAP; i++) {
++		text[at + (uint32_t)i] = c[i];
++	}
++	uint32_t end = MIN(at + (uint32_t)size, LAKELOG_CAP);
++	if (end > lake_log->len) {
++		lake_log->len = end;
++	}
++}
++
++/*
++ * The only way back to the host is a reset: the boot shim already set the
++ * PM660 PON reboot reason to "bootloader", so PSCI SYSTEM_RESET lands in
++ * fastboot. A panic first waits lakepanicwait seconds (default 20) so the
++ * screen can be read.
++ */
++void
++sweet_lake_reset(bool panicking)
++{
++	static uint32_t resetting;
++	uint32_t wait_s = 20;
++
++	if (os_atomic_xchg(&resetting, 1, relaxed)) {
++		for (;;) {
++			__builtin_arm_wfe();
++		}
++	}
++	if (panicking) {
++		PE_parse_boot_argn("lakepanicwait", &wait_s, sizeof(wait_s));
++		uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
++		__builtin_arm_isb(ISB_SY);
++		uint64_t end = __builtin_arm_rsr64("CNTPCT_EL0") + freq * wait_s;
++		while (__builtin_arm_rsr64("CNTPCT_EL0") < end) {
++			__builtin_arm_isb(ISB_SY);
++		}
++	}
++	static const char msg[] = "\nSWEET LAKE: PSCI SYSTEM_RESET (to fastboot)\n";
++	sweet_lakelog_append(msg, sizeof(msg) - 1);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++#endif /* SWEET_LAKE */
++
+ void
+ sweet_early_putc(char c)
+ {
+ 	if (early_disabled) {
+ 		return;
+ 	}
++#if SWEET_LAKE
++	sweet_lakelog_append(&c, 1);
++#endif
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+@@ -129,7 +227,10 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + (SWEET_FB_PHYS - SWEET_FB_BLOCK));
++#if SWEET_LAKE
++	lake_log = (volatile struct lakelog_header *)(uintptr_t)(base + (SWEET_LAKELOG_PHYS - SWEET_FB_BLOCK));
++#endif
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..9b685c7 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -5,6 +5,7 @@
+ #include <pexpert/arm64/board_config.h>
+ #include <stdarg.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ 
+ #if defined(SWEET)
+ void sweet_early_mark(unsigned int stage, const char *label);
+@@ -12,6 +13,10 @@ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++#if SWEET_LAKE
++void sweet_lakelog_append(const char *c, int size);
++void sweet_lake_reset(bool panicking) __dead2;
++#endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..aabb32e 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1158,6 +1158,9 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ void
+ panic_spin_forever(void)
+ {
++#if SWEET_LAKE
++	sweet_lake_reset(true);
++#endif
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+@@ -1171,6 +1174,9 @@ panic_spin_forever(void)
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++#if SWEET_LAKE
++	sweet_lake_reset(type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts);
++#endif
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..cc72d93 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -17,6 +17,22 @@
+ 
+ #define SWEET                     1
+ 
++/*
++ * SWEET_LAKE: the same port on the Moto G7 Plus ("lake", SDM636). Kryo 260
++ * = Cortex-A73 gold (MPIDR 0x100-0x103) + Cortex-A53 silver (0x000-0x003),
++ * ARMv8.0: no PAN, no LSE atomics (MakeInc.def: -march=armv8-a). Only the
++ * gold cores implement the 16K granule (ID_AA64MMFR0 0x101122 vs 0x1122),
++ * so the boot shim enters XNU on 0x100 and the silver cluster stays off.
++ * Remove this line to build for the Redmi Note 10 Pro again (and restore
++ * -march=armv8.2-a and config_arm_pfz).
++ */
++#define SWEET_LAKE                1
++
++#if SWEET_LAKE
++/* The four gold cores, one SMP cluster; boot CPU = MPIDR 0x100. */
++#define SWEET_SMP_MAX_CPUS         4
++#define SWEET_BOOT_MPIDR           0x100
++#else
+ /*
+  * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+@@ -24,6 +40,31 @@
+  * clusters yet).
+  */
+ #define SWEET_SMP_MAX_CPUS         8
++#define SWEET_BOOT_MPIDR           0
++#endif
++
++/*
++ * ABL's continuous-splash framebuffer (a8r8g8b8, the panel keeps scanning
++ * it out). start.s and arm_vm_init map the 32MB block holding it Normal-NC
++ * for the early console; on lake that block also holds the RAM log.
++ */
++#define SWEET_FB_BLOCK            0x9c000000
++#define SWEET_FB_WIDTH            1080
++#define SWEET_FB_STRIDE           (SWEET_FB_WIDTH * 4)
++#if SWEET_LAKE
++#define SWEET_FB_PHYS             0x9d400000
++#define SWEET_FB_HEIGHT           2270
++/*
++ * lakelog: console mirror in the unused tail of the splash carve-out
++ * (0x9d400000 + 35MB). It survives a warm reset, ABL and a Linux boot;
++ * the boot shim starts it, XNU appends (tools/lake-log.py reads it).
++ */
++#define SWEET_LAKELOG_PHYS        0x9de00000
++#define SWEET_LAKELOG_SIZE        0x100000
++#else
++#define SWEET_FB_PHYS             0x9c000000
++#define SWEET_FB_HEIGHT           2400
++#endif
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+@@ -33,7 +74,11 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
++#if SWEET_LAKE
++#define __ARM_PAN_AVAILABLE__     0
++#else
+ #define __ARM_PAN_AVAILABLE__     1
++#endif
+ #define __ARM_16K_PG__            1
+ 
+ #define HAS_GIC_V3                1

@@ -12,7 +12,7 @@ import os
 import struct
 import sys
 
-LOG_BASE, LOG_SIZE = 0x9f000000, 0x100000
+LOG_BASE, LOG_SIZE = 0x9de00000, 0x100000
 
 
 def read_devmem() -> bytes:
