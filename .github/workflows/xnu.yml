@@ -59,14 +59,9 @@ jobs:
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           # lake: libfirehose_kernel is built by xcodebuild with Apple's default
           # arm64 CPU (LSE atomics); its arm64 slice must be ARMv8.0 like xnu.
-          python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path('dxb/build.sh'); s = p.read_text()
-          old = 'VALID_ARCHS="x86_64 arm64e arm64"'
-          assert s.count(old) == 1
-          p.write_text(s.replace(old, old + " 'OTHER_CFLAGS[arch=arm64]=$(inherited) -mcpu=cortex-a73'"))
-          PY
-          grep -c 'OTHER_CFLAGS\[arch=arm64\]' dxb/build.sh
+          # xcodebuild takes conditional settings only from an xcconfig.
+          printf '%s\n' 'OTHER_CFLAGS[arch=arm64] = $(inherited) -mcpu=cortex-a73' > "$GITHUB_WORKSPACE/lake-arm64.xcconfig"
+          echo "XCODE_XCCONFIG_FILE=$GITHUB_WORKSPACE/lake-arm64.xcconfig" >> "$GITHUB_ENV"
           ls dxb/patches
 
       - name: Deps
