@@ -141,9 +141,12 @@ jobs:
           k=$(find out -maxdepth 1 -type f -name 'kernel.*' | head -1)
           xcrun objdump -d --mattr=+v8.5a "$k" > dis.txt
           pat='[[:space:]](cas|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|ldapr|ldapur|stlur)[a-z]*[[:space:]]'
-          bad=$(grep -cE "$pat" dis.txt || true)
+          # Data tables in code sections decode as anything (e.g. 0x78a5636f in
+          # the SHA-256 constants K256 reads as ldumaxah): skip known tables.
+          awk -v pat="$pat" '/^[0-9a-f]+ <.*>:$/ { fn = $2 } $0 ~ pat && fn !~ /^<K(256|512)>:$/ { print fn, $0 }' dis.txt > bad.txt
+          bad=$(wc -l < bad.txt | tr -d ' ')
           echo "post-ARMv8.0 instructions in $k: $bad"
-          awk -v pat="$pat" '/^[0-9a-f]+ <.*>:$/ { fn = $2 } $0 ~ pat { print fn, $0 }' dis.txt | head -30 || true
+          head -30 bad.txt
           [ "$bad" = 0 ]
 
       - name: Publish the kernel (lake)
