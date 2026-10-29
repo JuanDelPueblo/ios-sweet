@@ -1,6 +1,8 @@
 /*
- * Lake (Moto G7 Plus, SDM636) milestones L1-L2: one boot answers the questions
- * that decide the XNU port on this SoC.
+ * Lake (Moto G7 Plus, SDM636) boot shim. With an xnu payload in the ramdisk
+ * CPU0 hands over to the first gold core, which boots it (milestone L3);
+ * without one, milestones L1-L2: one boot answers the questions that decide
+ * the XNU port on this SoC.
  *   - SPMI: PM660 PON reboot reason, so every reset lands in fastboot
  *   - CPU0 is a Kryo 260 Silver (A53, no 16K granule): PSCI CPU_ON the first
  *     gold core (MPIDR 0x100) and CPU_OFF CPU0
@@ -12,6 +14,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "lakelog.h"
+#include "loader.h"
 #include "mmu.h"
 #include "spmi.h"
 
@@ -27,6 +30,13 @@
 #define PM660L_SID		2
 #define LDO_L2B			0x4100	/* microSD VDD-IO (vqmmc) */
 #define LDO_L5B			0x4400	/* microSD VDD (vmmc) */
+
+#define APSS_WDT_BASE		0x17817000UL	/* qcom,msm-watchdog, kpss register layout */
+#define WDT_RST			0x04
+#define WDT_EN			0x08
+#define WDT_BARK_TIME		0x10
+#define WDT_BITE_TIME		0x14
+#define WDT_HZ			32768
 
 #define PON_PERPH_TYPE		0x804	/* PM660 = SID 0, PON at 0x800 */
 #define PON_PERPH_SUBTYPE	0x805
@@ -75,6 +85,8 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
+static uintptr_t boot_dtb;
+static const char *xnu_cmdline;	/* payload present */
 static volatile uint32_t gold_alive, cpu0_handed;
 static volatile uint64_t cpu0_off_ret;
 static volatile uint64_t sec_mpidr[NR_CPUS], sec_mmfr0[NR_CPUS];
@@ -117,6 +129,20 @@ static int set_reason_bootloader(void)
 	if (rc)
 		return rc;
 	return spmi_write(0, PON_SOFT_RB_SPARE, (v & 1) | PON_REASON_BOOTLOADER);
+}
+
+/*
+ * Hardware safety net for hangs: nobody pets the APSS watchdog, so it
+ * bites (resets the SoC) after secs; the PON reason then lands in fastboot.
+ */
+static void wdt_arm(unsigned secs)
+{
+	wr32(APSS_WDT_BASE + WDT_EN, 0);
+	wr32(APSS_WDT_BASE + WDT_RST, 1);
+	wr32(APSS_WDT_BASE + WDT_BARK_TIME, secs * WDT_HZ + WDT_HZ);	/* after the bite: no bark IRQ */
+	wr32(APSS_WDT_BASE + WDT_BITE_TIME, secs * WDT_HZ);
+	wr32(APSS_WDT_BASE + WDT_EN, 1);
+	dsb();
 }
 
 static void __attribute__((noreturn)) reset_to_fastboot(unsigned after_ms)
@@ -352,6 +378,40 @@ static void probe_sd(void)
 	con_hex2(" ctl", "host/pwr=", rd32(SDHC2_BASE + 0x28), "clk=", rd32(SDHC2_BASE + 0x2c));
 }
 
+/* Value of "key=N" (decimal) in a command line, else def. */
+static unsigned arg_uint(const char *cmdline, const char *key, unsigned def)
+{
+	for (const char *s = cmdline; *s; s++) {
+		if (s != cmdline && s[-1] != ' ')
+			continue;
+		const char *k = key, *v = s;
+		while (*k && *v == *k)
+			k++, v++;
+		if (*k || *v != '=')
+			continue;
+		unsigned n = 0;
+		for (v++; *v >= '0' && *v <= '9'; v++)
+			n = n * 10 + (unsigned)(*v - '0');
+		return n;
+	}
+	return def;
+}
+
+/* Gold core: boot xnu with the MMU and caches off, as from ABL. */
+static void __attribute__((noreturn)) gold_boot_xnu(void)
+{
+	stage = "loader";
+	unsigned wdt = arg_uint(xnu_cmdline, "lakewdt", 0);
+	if (wdt) {
+		if (wdt > 31)
+			wdt = 31;	/* 20-bit bite counter at 32768 Hz */
+		con_hex("WDT bite s", wdt);
+		wdt_arm(wdt);
+	}
+	con_str("LOADER", loader_boot(boot_dtb));
+	reset_to_fastboot(10000);
+}
+
 static void gold_main(void)
 {
 	gold_alive = 1;
@@ -359,6 +419,8 @@ static void gold_main(void)
 	while (!cpu0_handed)
 		;
 	delay_ms(50);
+	if (xnu_cmdline)
+		gold_boot_xnu();
 	stage = "gold";
 	con_skip();
 	con_hex2("GOLD", "midr=", rsr("midr_el1"), "mpidr=", rsr("mpidr_el1"));
@@ -372,6 +434,14 @@ static void gold_main(void)
 
 	stage = "done";
 	con_str("DONE", "milestone L2");
+#ifdef WDT_TEST
+	set_reason_bootloader();
+	con_hex2("WDT", "en=", rd32(APSS_WDT_BASE + WDT_EN), "bite=", rd32(APSS_WDT_BASE + WDT_BITE_TIME));
+	wdt_arm(10);
+	con_hex2("WDT", "armed en=", rd32(APSS_WDT_BASE + WDT_EN), "bite=", rd32(APSS_WDT_BASE + WDT_BITE_TIME));
+	for (;;)
+		__asm__ volatile("wfe");
+#endif
 	reset_to_fastboot(5000);
 }
 
@@ -394,8 +464,10 @@ void shim_main(uint64_t dtb)
 
 	log_init();
 	stage = "cpu0";
+	boot_dtb = dtb;
+	xnu_cmdline = loader_cmdline(dtb);
 	con_clear(RED);
-	con_str("SHIM", "lake milestone L2");
+	con_str("SHIM", xnu_cmdline ? "lake L3: xnu on gold" : "lake milestone L2");
 	con_hex2("BOOT", "n=", log_boots(), "el=", rsr("CurrentEL") >> 2);
 	con_hex2("CPU0", "midr=", rsr("midr_el1"), "mpidr=", rsr("mpidr_el1"));
 	con_hex("MMFR0", rsr("id_aa64mmfr0_el1"));

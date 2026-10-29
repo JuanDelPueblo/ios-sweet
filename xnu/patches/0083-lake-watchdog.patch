@@ -1,0 +1,105 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..fe44e7a 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -542,6 +542,9 @@ arm_init(
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
++#if SWEET_LAKE
++	sweet_lake_wdt_init();
++#endif
+ 	if (serial_exists) {
+ 		sweet_early_disable();
+ 	}
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..dd5cd17 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -55,6 +55,7 @@
+ #include <pexpert/arm/protos.h>
+ #include <pexpert/arm64/apple_arm64_regs.h>
+ #include <pexpert/arm64/board_config.h>
++#include <arm64/sweet_early.h>
+ 
+ #include <vm/vm_page.h>
+ #include <vm/pmap.h>
+@@ -1869,6 +1870,9 @@ sleh_irq(arm_saved_state_t *state)
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++#if SWEET_LAKE
++		sweet_lake_wdt_pet();
++#endif
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 3ed0274..fc99046 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -12,6 +12,10 @@
+ #include <kern/misc_protos.h>
+ #include <machine/atomic.h>
+ #include <pexpert/pexpert.h>
++#if SWEET_LAKE
++#include <arm/machine_routines.h>
++#include <mach/mach_time.h>
++#endif
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PHYS;
+ #define EARLY_FB early_fb
+@@ -97,6 +101,40 @@ sweet_lakelog_append(const char *c, int size)
+ 	}
+ }
+ 
++/*
++ * Hang safety net: with lakewdt=N on the command line the boot shim arms
++ * the APSS watchdog (bite after N <= 31 s). Every timer interrupt pets it,
++ * until lakewdt_max seconds of uptime (default 300, 0 = forever), so a
++ * kernel with dead interrupts and a stuck boot both end in a reset into
++ * fastboot. Harmless when the shim did not arm it.
++ */
++#define LAKE_WDT_PHYS           0x17817000ULL   /* qcom,msm-watchdog, kpss layout */
++#define LAKE_WDT_RST            0x4
++
++static volatile uint32_t *lake_wdt_rst;
++static uint64_t lake_wdt_until;
++
++void
++sweet_lake_wdt_init(void)
++{
++	uint32_t max_s = 300;
++
++	PE_parse_boot_argn("lakewdt_max", &max_s, sizeof(max_s));
++	lake_wdt_until = max_s ? mach_absolute_time() + (uint64_t)max_s * 19200000ULL : UINT64_MAX;
++	vm_offset_t va = ml_io_map(LAKE_WDT_PHYS, PAGE_SIZE);
++	lake_wdt_rst = (volatile uint32_t *)(va + LAKE_WDT_RST);
++	*lake_wdt_rst = 1;
++	printf("SWEET LAKE: watchdog petted from the timer interrupt for %u s\n", max_s);
++}
++
++void
++sweet_lake_wdt_pet(void)
++{
++	if (lake_wdt_rst != NULL && mach_absolute_time() < lake_wdt_until) {
++		*lake_wdt_rst = 1;
++	}
++}
++
+ /*
+  * The only way back to the host is a reset: the boot shim already set the
+  * PM660 PON reboot reason to "bootloader", so PSCI SYSTEM_RESET lands in
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 9b685c7..e3a8902 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -16,6 +16,8 @@ void sweet_early_disable(void);
+ #if SWEET_LAKE
+ void sweet_lakelog_append(const char *c, int size);
+ void sweet_lake_reset(bool panicking) __dead2;
++void sweet_lake_wdt_init(void);
++void sweet_lake_wdt_pet(void);
+ #endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)

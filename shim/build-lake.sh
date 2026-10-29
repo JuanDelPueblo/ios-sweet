@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CC="clang --target=aarch64-none-elf"
 # -fno-jump-tables: clang otherwise turns switches into tables of absolute pointers
-CFLAGS="-O2 -fno-jump-tables -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CFLAGS="${EXTRA_CFLAGS:-} -O2 -fno-jump-tables -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 OUT=out-lake
 SRCS="start.S lake.c console.c lakelog.c spmi.c mmu.c fdt.c loader.c"
 mkdir -p $OUT
