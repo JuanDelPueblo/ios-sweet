@@ -57,6 +57,16 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # lake: libfirehose_kernel is built by xcodebuild with Apple's default
+          # arm64 CPU (LSE atomics); its arm64 slice must be ARMv8.0 like xnu.
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('dxb/build.sh'); s = p.read_text()
+          old = 'VALID_ARCHS="x86_64 arm64e arm64"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, old + " 'OTHER_CFLAGS[arch=arm64]=$(inherited) -mcpu=cortex-a73'"))
+          PY
+          grep -c 'OTHER_CFLAGS\[arch=arm64\]' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
@@ -138,7 +148,7 @@ jobs:
           pat='[[:space:]](cas|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|ldapr|ldapur|stlur)[a-z]*[[:space:]]'
           bad=$(grep -cE "$pat" dis.txt || true)
           echo "post-ARMv8.0 instructions in $k: $bad"
-          grep -E "$pat" dis.txt | head -20 || true
+          awk -v pat="$pat" '/^[0-9a-f]+ <.*>:$/ { fn = $2 } $0 ~ pat { print fn, $0 }' dis.txt | head -30 || true
           [ "$bad" = 0 ]
 
       - name: Publish the kernel (lake)
