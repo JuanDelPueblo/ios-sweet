@@ -16,6 +16,7 @@
 #include "lakelog.h"
 #include "loader.h"
 #include "mmu.h"
+#include "sdhc.h"
 #include "spmi.h"
 
 #define PSHOLD			0x010ac000UL
@@ -25,11 +26,6 @@
 #define GCC_SDCC2_AHB_CBCR	0x14008
 #define GCC_QUP3_I2C_CBCR	0x1d008
 
-#define GCC_SDCC2_CMD_RCGR	0x14010
-#define SDHC2_BASE		0x0c084000UL	/* sdhc_2: microSD */
-#define PM660L_SID		2
-#define LDO_L2B			0x4100	/* microSD VDD-IO (vqmmc) */
-#define LDO_L5B			0x4400	/* microSD VDD (vmmc) */
 
 #define APSS_WDT_BASE		0x17817000UL	/* qcom,msm-watchdog, kpss register layout */
 #define WDT_RST			0x04
@@ -341,43 +337,6 @@ static void test_mmu(void)
 	con_hex("PAR log", mmu_probe(LOG_BASE));
 }
 
-static void dump_ldo(const char *label, uint16_t base)
-{
-	static const uint8_t regs[] = { 0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46 };
-	uint8_t v[sizeof(regs)];
-	int rc = 0;
-
-	for (unsigned i = 0; i < sizeof(regs); i++) {
-		v[i] = 0;
-		rc |= spmi_read(PM660L_SID, base + regs[i], &v[i]);
-	}
-	con_hex2(label, "type=", v[0] << 8 | v[1], "st=", v[2] | (rc & 0xff) << 16);
-	con_hex2(" vset", "mv=", v[3] | v[4] << 8, "mode/en=", v[5] << 8 | v[6]);
-}
-
-/* Read-only look at the microSD path: rails, then clocks + SDHCI registers. */
-static void probe_sd(void)
-{
-	stage = "sd";
-	dump_ldo("L2B", LDO_L2B);
-	dump_ldo("L5B", LDO_L5B);
-	con_hex2("RCG2", "cmd=", rd32(GCC_BASE + GCC_SDCC2_CMD_RCGR), "cfg=",
-		 rd32(GCC_BASE + GCC_SDCC2_CMD_RCGR + 4));
-	wr32(GCC_BASE + GCC_SDCC2_AHB_CBCR, rd32(GCC_BASE + GCC_SDCC2_AHB_CBCR) | 1);
-	wr32(GCC_BASE + GCC_SDCC2_APPS_CBCR, rd32(GCC_BASE + GCC_SDCC2_APPS_CBCR) | 1);
-	for (int i = 0; i < 1000 && (rd32(GCC_BASE + GCC_SDCC2_AHB_CBCR) & (1U << 31)); i++)
-		delay_ms(1);
-	uint32_t ahb = rd32(GCC_BASE + GCC_SDCC2_AHB_CBCR);
-	con_hex2("SDCC2", "ahb=", ahb, "apps=", rd32(GCC_BASE + GCC_SDCC2_APPS_CBCR));
-	if (ahb & (1U << 31)) {
-		con_str("SDHC", "AHB clock stays off, skip");
-		return;
-	}
-	con_hex2("SDHC", "ver=", rd32(SDHC2_BASE + 0xfc) >> 16, "pstate=", rd32(SDHC2_BASE + 0x24));
-	con_hex2(" caps", "lo=", rd32(SDHC2_BASE + 0x40), "hi=", rd32(SDHC2_BASE + 0x44));
-	con_hex2(" ctl", "host/pwr=", rd32(SDHC2_BASE + 0x28), "clk=", rd32(SDHC2_BASE + 0x2c));
-}
-
 /* Value of "key=N" (decimal) in a command line, else def. */
 static unsigned arg_uint(const char *cmdline, const char *key, unsigned def)
 {
@@ -429,7 +388,7 @@ static void gold_main(void)
 
 	test_smp();
 	test_gic();
-	probe_sd();
+	test_sdhc();
 	test_mmu();
 
 	stage = "done";

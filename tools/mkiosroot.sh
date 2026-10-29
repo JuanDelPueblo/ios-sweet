@@ -4,6 +4,9 @@
 #
 #   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
 #
+# OS/SYSTEMOS/APPOS may also be directories where the images are already
+# mounted (apfs-fuse run by the caller, e.g. outside a User-Mode Linux that
+# sees them through hostfs).
 # OUT may also be a block device (e.g. the lake microSD partition, run as
 # root on the phone): it is formatted in place and SIZE is ignored. Run as
 # root, no sudo is used.
@@ -29,7 +32,9 @@ sudo() { if [[ $(id -u) == 0 ]]; then "$@"; else command sudo "$@"; fi; }
 
 # Pre-flight tool check
 missing_tools=()
-for tool in apfs-fuse mkfs.hfsplus rsync; do
+tools="mkfs.hfsplus rsync"
+[[ -d $os && -d $sysos && -d $appos ]] || tools="apfs-fuse $tools"
+for tool in $tools; do
 	command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
 
@@ -66,6 +71,10 @@ trap cleanup EXIT
 # Keep the .dmg name: apfs-fuse only parses UDIF images (the OS one is UDIF,
 # the cryptexes are raw APFS) when the file name ends in .dmg.
 apfs_mount() {
+	if [[ -d $1 ]]; then	# already mounted by the caller
+		ln -s "$1" "$work/$2"
+		return
+	fi
 	ln -s "$1" "$work/$2.dmg"
 	mkdir "$work/$2"
 	# As root: a user's FUSE mount is unreadable to the root rsync below.

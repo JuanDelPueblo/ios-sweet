@@ -129,6 +129,18 @@ jobs:
           path: out/
           if-no-files-found: warn
 
+      - name: Check for instructions lake's Kryo 260 lacks (lake)
+        if: success() && github.ref == 'refs/heads/lake'
+        run: |
+          # ARMv8.0 only: no LSE atomics (v8.1) and no RCpc loads (v8.3).
+          k=$(find out -maxdepth 1 -type f -name 'kernel.*' | head -1)
+          xcrun objdump -d --mattr=+v8.5a "$k" > dis.txt
+          pat='[[:space:]](cas|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|ldapr|ldapur|stlur)[a-z]*[[:space:]]'
+          bad=$(grep -cE "$pat" dis.txt || true)
+          echo "post-ARMv8.0 instructions in $k: $bad"
+          grep -E "$pat" dis.txt | head -20 || true
+          [ "$bad" = 0 ]
+
       - name: Publish the kernel (lake)
         if: success() && github.ref == 'refs/heads/lake'
         env:

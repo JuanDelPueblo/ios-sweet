@@ -88,16 +88,18 @@ index 2545cf9..9a6a78e 100644
  	for (unsigned int i = 0; i < topology->num_cpus; i++) {
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 9a748ea..196a66b 100644
+index 9a748ea..9510317 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
-@@ -61,7 +61,8 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+@@ -61,7 +61,10 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
  MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
  MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
  MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
 -MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
-+# lake (SWEET_LAKE in SWEET.h): Kryo 260 is ARMv8.0, no LSE atomics, no PAN
-+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crc+crypto
++# lake (SWEET_LAKE in SWEET.h): Kryo 260 is ARMv8.0, no LSE atomics, no PAN.
++# An explicit -mcpu: with -march alone Apple clang keeps its macOS arm64
++# default CPU (apple-m1) and still emits LSE (casa, ldadd) and RCpc (ldapr).
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a73
  
  
  #
