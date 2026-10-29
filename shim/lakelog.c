@@ -26,6 +26,9 @@ void log_init(void)
 		ok &= HDR->magic[i] == magic[i];
 	HDR->boots = ok ? HDR->boots + 1 : 1;
 	HDR->len = 0;
+	HDR->pad = 0;		/* xnu's start.s breadcrumb */
+	for (int i = 0; i < 8; i++)	/* stale early-exception record */
+		((volatile char *)(LOG_BASE + LOG_SIZE - 64))[i] = 0;
 	for (int i = 0; i < 8; i++)
 		HDR->magic[i] = magic[i];
 	__asm__ volatile("dsb sy" ::: "memory");

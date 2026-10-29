@@ -1,0 +1,216 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index fe44e7a..16aff21 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,9 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++#if SWEET_LAKE
++	*(volatile uint64_t *)(uintptr_t)(SWEET_LAKELOG_PHYS + 16) = 0x21;     /* V=P breadcrumb */
++#endif
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f074c6b..0c1c7c9 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -73,6 +73,45 @@
+ #endif
+ .endmacro
+ 
++#if SWEET_LAKE
++/*
++ * lakelog breadcrumb: the furthest start.s step reached goes into the log
++ * header's pad word (SWEET_LAKELOG_PHYS + 16), written V=P: with the MMU
++ * off, then through the bootstrap V=P map of the framebuffer block. x16 and
++ * x17 are free here.
++ */
++.macro LAKE_CRUMB
++	MOV64	x16, (SWEET_LAKELOG_PHYS + 16)
++	mov		x17, #($0)
++	str		x17, [x16]
++	dsb		sy
++.endmacro
++
++/*
++ * Early exception (before the kernel vectors are installed): record slot,
++ * ESR, ELR, FAR and SPSR as "LAKEEXC1" in the last 64 bytes of the lakelog,
++ * then spin until the shim's watchdog resets into fastboot. At most 32
++ * instructions per vector slot.
++ */
++.macro LAKE_LOWVEC
++	MOV64	x16, (SWEET_LAKELOG_PHYS + SWEET_LAKELOG_SIZE - 64)
++	MOV64	x17, 0x31435845454b414c
++	str		x17, [x16]
++	mov		x17, #($0)
++	str		x17, [x16, #8]
++	mrs		x17, ESR_EL1
++	str		x17, [x16, #16]
++	mrs		x17, ELR_EL1
++	str		x17, [x16, #24]
++	mrs		x17, FAR_EL1
++	str		x17, [x16, #32]
++	mrs		x17, SPSR_EL1
++	str		x17, [x16, #40]
++	dsb		sy
++	b		.
++.endmacro
++#endif
++
+ .macro MSR_SCTLR_EL1_X0
+ #if defined(KERNEL_INTEGRITY_KTRR)
+ 	mov		x1, lr
+@@ -233,40 +272,104 @@ LEXT(_start)
+ 	.global	EXT(LowExceptionVectorBase)
+ LEXT(LowExceptionVectorBase)
+ 	/* EL1 SP 0 */
++#if SWEET_LAKE
++	LAKE_LOWVEC 0
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 1
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 2
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 3
++#else
+ 	b		.
++#endif
+ 	/* EL1 SP1 */
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 4
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 5
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 6
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 7
++#else
+ 	b		.
++#endif
+ 	/* EL0 64 */
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 8
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 9
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 10
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 11
++#else
+ 	b		.
++#endif
+ 	/* EL0 32 */
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 12
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 13
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 14
++#else
+ 	b		.
++#endif
+ 	.align	7
++#if SWEET_LAKE
++	LAKE_LOWVEC 15
++#else
+ 	b		.
++#endif
+ 	.align 12, 0
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+@@ -530,6 +633,9 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++#if SWEET_LAKE
++	LAKE_CRUMB 0x11
++#endif
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -693,6 +799,9 @@ Lkernelcache_base_found:
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#if SWEET_LAKE
++	LAKE_CRUMB 0x12
++#endif
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+@@ -832,10 +941,16 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++#if SWEET_LAKE
++	LAKE_CRUMB 0x13
++#endif
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++#if SWEET_LAKE
++	LAKE_CRUMB 0x14
++#endif
+ 
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+@@ -899,6 +1014,9 @@ common_start:
+ 	mov	lr, x21
+ #endif
+ 
++#if SWEET_LAKE
++	LAKE_CRUMB 0x15
++#endif
+ 	// Return to arm_init()
+ 	ret
+ 

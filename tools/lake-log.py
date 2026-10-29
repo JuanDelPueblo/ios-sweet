@@ -4,6 +4,10 @@
   lake-log.py            on the phone, as root, under any Linux with /dev/mem
   lake-log.py RAW        parse a raw dump of the 1MB log region
 
+Header: "LAKELOG1", u32 boots, u32 text length, u64 xnu start.s breadcrumb
+(0x11 entry .. 0x15 jump to arm_init, 0x21 arm_init), then the text. The
+last 64 bytes may hold an early exception record ("LAKEEXC1").
+
 The log lives in the unused tail of the splash carve-out, which Linux maps
 no-map: read() of /dev/mem refuses it on arm64, mmap() works.
 """
@@ -26,9 +30,13 @@ def main() -> None:
     raw = open(sys.argv[1], "rb").read() if len(sys.argv) > 1 else read_devmem()
     if raw[:8] != b"LAKELOG1":
         sys.exit(f"no lake log (magic {raw[:8]!r})")
-    boots, length = struct.unpack_from("<II", raw, 8)
-    print(f"# boots={boots} len={length}")
+    boots, length, crumb = struct.unpack_from("<IIQ", raw, 8)
+    print(f"# boots={boots} len={length} xnu start.s breadcrumb={crumb:#x}")
     sys.stdout.write(raw[24:24 + length].decode(errors="replace"))
+    exc = raw[LOG_SIZE - 64:]
+    if exc[:8] == b"LAKEEXC1":   # early exception, xnu 0084 LAKE_LOWVEC
+        slot, esr, elr, far, spsr = struct.unpack_from("<5Q", exc, 8)
+        print(f"\n# early exception: vector slot {slot} ESR={esr:#x} ELR={elr:#x} FAR={far:#x} SPSR={spsr:#x}")
 
 
 if __name__ == "__main__":
