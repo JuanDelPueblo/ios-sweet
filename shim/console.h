@@ -1,9 +1,9 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
+#define FB_BASE		0x9d400000UL	/* reserved-memory cont_splash, lake live DTB */
 #define FB_W		1080
-#define FB_H		2400
+#define FB_H		2270
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
 
 #define RED	0xffff0000U

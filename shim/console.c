@@ -4,6 +4,7 @@
  */
 #include "console.h"
 #include "font.h"
+#include "lakelog.h"
 
 #define SCALE		3
 #define CH_W		(8 * SCALE)
@@ -71,6 +72,10 @@ void con_str(const char *label, const char *s)
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
+	log_puts(label);
+	log_puts(" ");
+	log_puts(s);
+	log_puts("\n");
 }
 
 void con_hex(const char *label, uint64_t v)
@@ -88,10 +93,18 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	col = put_str(col, a, YELLOW);
 	fmt_hex(buf, va, 8);
 	col = put_str(col, buf, WHITE);
+	log_puts(label);
+	log_puts(" ");
+	log_puts(a);
+	log_puts(buf);
 	if (b) {
 		col = put_str(col + 1, b, YELLOW);
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
+		log_puts(" ");
+		log_puts(b);
+		log_puts(buf);
 	}
+	log_puts("\n");
 	row++;
 }
