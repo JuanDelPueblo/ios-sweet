@@ -1,0 +1,199 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b06167b..3810c68 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -464,12 +464,32 @@ sd_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, uint64_t u
+ 	uint64_t end = sd_deadline(us);
+ 	while ((*(volatile uint32_t *)(base + off) & mask) != want) {
+ 		if (mach_absolute_time() > end) {
+-			return ETIMEDOUT;
++			/* Preempted past the deadline? Look once more before giving up. */
++			return (*(volatile uint32_t *)(base + off) & mask) == want ? 0 : ETIMEDOUT;
+ 		}
+ 	}
+ 	return 0;
+ }
+ 
++/*
++ * Wait for any of mask in the interrupt status (errors always end the wait):
++ * the status, or 0 on timeout. One CPU under load can preempt this thread
++ * past the deadline, so the status is read again before declaring a timeout.
++ */
++static uint32_t
++sd_wait_int(uint32_t mask, uint64_t us)
++{
++	uint64_t end = sd_deadline(us);
++	uint32_t st;
++	while (!((st = *(volatile uint32_t *)(su.regs + SDHCI_INT)) & (mask | INT_ERR))) {
++		if (mach_absolute_time() > end) {
++			st = *(volatile uint32_t *)(su.regs + SDHCI_INT);
++			return (st & (mask | INT_ERR)) ? st : 0;
++		}
++	}
++	return st;
++}
++
+ /* Linux sdhci_msm_handle_pwr_irq: acknowledge bus and I/O voltage requests. */
+ static void
+ sd_pwrctl_ack(void)
+@@ -531,15 +551,12 @@ sd_cmd_once(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t
+ 	sd_wr32(SDHCI_INT, 0xffffffff);
+ 	sd_wr32(SDHCI_ARG, arg);
+ 	sd_wr32(SDHCI_XFER, mode | (uint32_t)(idx << 8 | flags) << 16);
+-	uint64_t end = sd_deadline(100000);
+-	uint32_t st;
+-	while (!((st = sd_rd32(SDHCI_INT)) & (INT_CMD_DONE | INT_ERR))) {
+-		if (mach_absolute_time() > end) {
+-			printf("LAKE SD: CMD%u arg 0x%x: no completion, int 0x%x pstate 0x%x\n",
+-			    idx, arg, st, sd_rd32(SDHCI_PSTATE));
+-			sd_reset_lines();
+-			return ETIMEDOUT;
+-		}
++	uint32_t st = sd_wait_int(INT_CMD_DONE, 100000);
++	if (st == 0) {
++		printf("LAKE SD: CMD%u arg 0x%x: no completion, int 0x%x pstate 0x%x\n",
++		    idx, arg, sd_rd32(SDHCI_INT), sd_rd32(SDHCI_PSTATE));
++		sd_reset_lines();
++		return ETIMEDOUT;
+ 	}
+ 	if (st & INT_ERR) {
+ 		printf("LAKE SD: CMD%u arg 0x%x error 0x%x\n", idx, arg, st >> 16);
+@@ -554,13 +571,11 @@ sd_cmd_once(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t
+ 	}
+ 	if (flags == R_48_BUSY) {
+ 		/* R1b: transfer complete marks the end of the card's busy on DAT0 */
+-		end = sd_deadline(1000000);
+-		while (!((st = sd_rd32(SDHCI_INT)) & (INT_XFER_DONE | INT_ERR))) {
+-			if (mach_absolute_time() > end) {
+-				printf("LAKE SD: CMD%u busy did not end, pstate 0x%x\n", idx, sd_rd32(SDHCI_PSTATE));
+-				sd_reset_lines();
+-				return ETIMEDOUT;
+-			}
++		st = sd_wait_int(INT_XFER_DONE, 1000000);
++		if (st == 0) {
++			printf("LAKE SD: CMD%u busy did not end, pstate 0x%x\n", idx, sd_rd32(SDHCI_PSTATE));
++			sd_reset_lines();
++			return ETIMEDOUT;
+ 		}
+ 		sd_wr32(SDHCI_INT, INT_XFER_DONE | (st & 0xffff0000u));
+ 	}
+@@ -569,7 +584,7 @@ sd_cmd_once(unsigned idx, uint32_t arg, unsigned flags, uint32_t mode, uint32_t
+ 
+ /* Multi-block PIO transfer of nsect sectors at sector to/from the bounce buffer. */
+ static int
+-sd_xfer(uint64_t sector, uint32_t nsect, bool write)
++sd_xfer_once(uint64_t sector, uint32_t nsect, bool write)
+ {
+ 	uint32_t *buf = (uint32_t *)(su.dma + DMA_BOUNCE);
+ 	if (sector > UINT32_MAX || nsect == 0 || nsect > 0xffff || nsect * 512ull > BOUNCE_SIZE) {
+@@ -583,15 +598,12 @@ sd_xfer(uint64_t sector, uint32_t nsect, bool write)
+ 	}
+ 	uint32_t ready = write ? INT_BUF_WR : INT_BUF_RD;
+ 	for (uint32_t b = 0; b < nsect; b++) {
+-		uint64_t end = sd_deadline(1000000);
+-		uint32_t st;
+-		while (!((st = sd_rd32(SDHCI_INT)) & (ready | INT_ERR))) {
+-			if (mach_absolute_time() > end) {
+-				printf("LAKE SD: %s timeout at block %u of %u (sector 0x%llx)\n",
+-				    write ? "write" : "read", b, nsect, sector);
+-				sd_reset_lines();
+-				return ETIMEDOUT;
+-			}
++		uint32_t st = sd_wait_int(ready, 2000000);
++		if (st == 0) {
++			printf("LAKE SD: %s timeout at block %u of %u (sector 0x%llx, pstate 0x%x)\n",
++			    write ? "write" : "read", b, nsect, sector, sd_rd32(SDHCI_PSTATE));
++			sd_reset_lines();
++			return ETIMEDOUT;
+ 		}
+ 		if (st & INT_ERR) {
+ 			printf("LAKE SD: %s error 0x%x at block %u (sector 0x%llx)\n",
+@@ -612,13 +624,12 @@ sd_xfer(uint64_t sector, uint32_t nsect, bool write)
+ 		}
+ 	}
+ 	/* Transfer complete also covers auto CMD12 and the card's write busy. */
+-	uint64_t end = sd_deadline(2000000);
+-	uint32_t st;
+-	while (!((st = sd_rd32(SDHCI_INT)) & (INT_XFER_DONE | INT_ERR))) {
+-		if (mach_absolute_time() > end) {
+-			sd_reset_lines();
+-			return ETIMEDOUT;
+-		}
++	uint32_t st = sd_wait_int(INT_XFER_DONE, 3000000);
++	if (st == 0) {
++		printf("LAKE SD: %s of %u sectors at 0x%llx never completed (pstate 0x%x)\n",
++		    write ? "write" : "read", nsect, sector, sd_rd32(SDHCI_PSTATE));
++		sd_reset_lines();
++		return ETIMEDOUT;
+ 	}
+ 	if (st & INT_ERR) {
+ 		printf("LAKE SD: %s end error 0x%x (sector 0x%llx)\n", write ? "write" : "read",
+@@ -629,6 +640,51 @@ sd_xfer(uint64_t sector, uint32_t nsect, bool write)
+ 	return 0;
+ }
+ 
++static uint32_t sd_rca;
++static int sd_identify(int attempt);
++
++/*
++ * After a failed transfer the card may still be sending or receiving
++ * (a multi-block transfer only stops with CMD12): stop it, check that it
++ * is back in the transfer state (CMD13), else identify it from scratch.
++ * Without this one timeout left every later command unanswered.
++ */
++static int
++sd_recover(void)
++{
++	uint32_t r[4] = { 0 };
++
++	sd_reset_lines();
++	(void)sd_cmd_once(12, 0, R_48_BUSY, 0, r);      /* fails if already stopped */
++	r[0] = 0;
++	if (sd_cmd_once(13, sd_rca << 16, R_48, 0, r) == 0 && ((r[0] >> 9) & 0xfu) == 4) {
++		return 0;
++	}
++	printf("LAKE SD: card not in transfer state (status 0x%x), identifying it again\n", r[0]);
++	return sd_identify(9);
++}
++
++/* sd_xfer_once, recovering the card and retrying up to three times. */
++static int
++sd_xfer(uint64_t sector, uint32_t nsect, bool write)
++{
++	static unsigned reported;
++	int error = sd_xfer_once(sector, nsect, write);
++
++	for (int i = 0; error && error != EINVAL && i < 3; i++) {
++		int rerr = sd_recover();
++		if (!rerr) {
++			error = sd_xfer_once(sector, nsect, write);
++		}
++		if (reported < 100) {
++			reported++;
++			printf("LAKE SD: %s of %u sectors at 0x%llx: retry %d -> %d (recover %d)\n",
++			    write ? "write" : "read", nsect, sector, i + 1, error, rerr);
++		}
++	}
++	return error;
++}
++
+ /* Read count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+@@ -696,8 +752,6 @@ ufs_find_partition(__unused const char *want)
+ 	return ENOENT;
+ }
+ 
+-static int sd_identify(int attempt);
+-
+ /* Clocks, pads, power and the SD identification sequence: 0 with the card selected. */
+ static int
+ ufs_take_over_host(void)
+@@ -791,6 +845,7 @@ sd_identify(int attempt)
+ 		return error;
+ 	}
+ 	uint32_t rca = r[0] >> 16;
++	sd_rca = rca;
+ 	if ((error = sd_cmd(7, rca << 16, R_48_BUSY, 0, r))) {
+ 		return error;
+ 	}
