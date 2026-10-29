@@ -4,6 +4,10 @@
 #
 #   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
 #
+# OUT may also be a block device (e.g. the lake microSD partition, run as
+# root on the phone): it is formatted in place and SIZE is ignored. Run as
+# root, no sudo is used.
+#
 # The IPSW images are raw APFS with LZBITMAP-compressed files: they are read
 # through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. On a
 # device /private/preboot is its own volume holding the cryptexes, which
@@ -20,7 +24,8 @@ set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
-[[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
+[[ ! -e $out || -b $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
+sudo() { if [[ $(id -u) == 0 ]]; then "$@"; else command sudo "$@"; fi; }
 
 # Pre-flight tool check
 missing_tools=()
@@ -71,10 +76,16 @@ apfs_mount "$os" os
 apfs_mount "$sysos" sysos
 apfs_mount "$appos" appos
 
-truncate -s "$size" "$out"
-mkfs.hfsplus -s -J -v iOSRoot "$out"
+if [[ -b $out ]]; then
+	sudo mkfs.hfsplus -s -J -v iOSRoot "$out"
+	mount_opts=force
+else
+	truncate -s "$size" "$out"
+	mkfs.hfsplus -s -J -v iOSRoot "$out"
+	mount_opts=loop,force
+fi
 mkdir "$work/root"
-sudo mount -t hfsplus -o loop,force "$out" "$work/root"
+sudo mount -t hfsplus -o "$mount_opts" "$out" "$work/root"
 mounts=("$work/root" "${mounts[@]}")
 
 copy() {
@@ -131,5 +142,5 @@ df -h "$work/root"
 sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)
 # differently from Apple's tables; let fsck_hfs rewrite them, then verify.
-fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$out"
+sudo fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
+sudo fsck.hfsplus -f -n "$out"

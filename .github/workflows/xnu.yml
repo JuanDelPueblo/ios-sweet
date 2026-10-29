@@ -32,6 +32,12 @@ env:
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
 
+# lake: kernels are published as prerelease assets (artifact downloads count
+# against the account's Actions egress quota, release assets of a public repo
+# do not).
+permissions:
+  contents: write
+
 jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
@@ -90,7 +96,7 @@ jobs:
           ls -la buildtree.tgz
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && github.ref != 'refs/heads/lake'
         with:
           name: xnu-buildtree
           path: buildtree.tgz
@@ -117,8 +123,18 @@ jobs:
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && github.ref != 'refs/heads/lake'
         with:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      - name: Publish the kernel (lake)
+        if: success() && github.ref == 'refs/heads/lake'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="kernel-${GITHUB_SHA::7}-${GITHUB_RUN_ID}"
+          gh release create "$tag" $(find out -maxdepth 1 -type f -name 'kernel.*') out/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "$tag" --notes "xnu ${MACHINE_CONFIG} ${KERNEL_CONFIG} for lake, ${GITHUB_SHA}, run ${GITHUB_RUN_ID}"
