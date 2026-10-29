@@ -133,9 +133,13 @@ static int set_reason_bootloader(void)
  */
 static void wdt_arm(unsigned secs)
 {
+	uint32_t bark = secs * WDT_HZ + WDT_HZ;	/* after the bite: no bark IRQ */
+
+	if (bark > 0xfffff)
+		bark = 0xfffff;		/* 20-bit counter: 32 s would wrap to 0 */
 	wr32(APSS_WDT_BASE + WDT_EN, 0);
 	wr32(APSS_WDT_BASE + WDT_RST, 1);
-	wr32(APSS_WDT_BASE + WDT_BARK_TIME, secs * WDT_HZ + WDT_HZ);	/* after the bite: no bark IRQ */
+	wr32(APSS_WDT_BASE + WDT_BARK_TIME, bark);
 	wr32(APSS_WDT_BASE + WDT_BITE_TIME, secs * WDT_HZ);
 	wr32(APSS_WDT_BASE + WDT_EN, 1);
 	dsb();

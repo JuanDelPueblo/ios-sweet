@@ -1,0 +1,62 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6aaba31..fcfdeb4 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -106,23 +106,31 @@ sweet_lakelog_append(const char *c, int size)
+ /*
+  * Hang safety net: with lakewdt=N on the command line the boot shim arms
+  * the APSS watchdog (bite after N <= 31 s). Every timer interrupt pets it,
+- * until lakewdt_max seconds of uptime (default 300, 0 = forever), so a
+- * kernel with dead interrupts and a stuck boot both end in a reset into
+- * fastboot. Harmless when the shim did not arm it.
++ * until lakewdt_max seconds of uptime (default 300, 0 = forever); then the
++ * timer interrupt resets to fastboot itself, because the bite does not
++ * reliably reset the SoC once xnu runs. A kernel with dead interrupts still
++ * ends in the bite. Harmless when the shim did not arm the watchdog.
+  */
+ #define LAKE_WDT_PHYS           0x17817000ULL   /* qcom,msm-watchdog, kpss layout */
+ #define LAKE_WDT_RST            0x4
+ 
+ static volatile uint32_t *lake_wdt_rst;
+ static uint64_t lake_wdt_until;
++static uint64_t lake_dump_at = UINT64_MAX;
+ 
+ void
+ sweet_lake_wdt_init(void)
+ {
+ 	uint32_t max_s = 300;
+ 
++	uint32_t dump_s = 0;
++
+ 	PE_parse_boot_argn("lakewdt_max", &max_s, sizeof(max_s));
+ 	lake_wdt_until = max_s ? mach_absolute_time() + (uint64_t)max_s * 19200000ULL : UINT64_MAX;
++	/* lakedump=N: dump the waiting threads once, N s of uptime in */
++	if (PE_parse_boot_argn("lakedump", &dump_s, sizeof(dump_s)) && dump_s) {
++		lake_dump_at = (uint64_t)dump_s * 19200000ULL;
++	}
+ 	vm_offset_t va = ml_io_map(LAKE_WDT_PHYS, PAGE_SIZE);
+ 	lake_wdt_rst = (volatile uint32_t *)(va + LAKE_WDT_RST);
+ 	*lake_wdt_rst = 1;
+@@ -184,6 +192,10 @@ sweet_lake_wdt_pet(uint64_t pc, uint64_t lr)
+ 
+ 	if (lake_wdt_rst != NULL && now < lake_wdt_until) {
+ 		*lake_wdt_rst = 1;
++	} else if (lake_wdt_rst != NULL) {
++		static const char msg[] = "\nSWEET LAKE: lakewdt_max reached\n";
++		sweet_lakelog_append(msg, sizeof(msg) - 1);
++		sweet_lake_reset(false);
+ 	}
+ 	if (now >= next_beat) {
+ 		char line[96];
+@@ -193,9 +205,8 @@ sweet_lake_wdt_pet(uint64_t pc, uint64_t lr)
+ 			sweet_lakelog_append(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+ 		}
+ 		next_beat = now + 5 * 19200000ULL;
+-		static bool dumped;
+-		if (!dumped && now > 60 * 19200000ULL) {
+-			dumped = true;
++		if (now >= lake_dump_at) {
++			lake_dump_at = UINT64_MAX;
+ 			sweet_lake_dump_threads();
+ 		}
+ 	}
