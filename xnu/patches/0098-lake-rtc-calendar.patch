@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index d9576d4..7559437 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -125,6 +125,40 @@ keys_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++/*
++ * The PM660 RTC is a free-running seconds counter that nothing on lake sets
++ * to real time (Android and Linux keep an offset elsewhere). Boot-arg
++ * lakertcoff=N (real Unix time minus the RTC count, measured once from
++ * Linux) turns it into the calendar time, set before launchd starts.
++ */
++static void
++lk_set_calendar(void)
++{
++	uint32_t off = 0;
++	uint8_t b[4], again;
++
++	if (!PE_parse_boot_argn("lakertcoff", &off, sizeof(off)) || off == 0) {
++		return;
++	}
++	vm_offset_t rtc = lk_channel(LK_RTC_PPID);
++	for (int i = 0; i < 4; i++) {
++		if (!lk_read(rtc, (uint16_t)(LK_RTC_READ + i), &b[i])) {
++			printf("LAKE RTC: read failed (arb-status %#x)\n", lk_last_status);
++			return;
++		}
++	}
++	/* A carry between the byte reads: read the upper bytes again */
++	if (lk_read(rtc, LK_RTC_READ, &again) && again < b[0]) {
++		b[0] = again;
++		for (int i = 1; i < 4; i++) {
++			(void)lk_read(rtc, (uint16_t)(LK_RTC_READ + i), &b[i]);
++		}
++	}
++	uint32_t raw = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++	clock_set_calendar_microtime((clock_sec_t)raw + off, 0);
++	printf("LAKE RTC: count %u + offset %u = %llu\n", raw, off, (uint64_t)raw + off);
++}
++
+ void
+ sweet_keys_init(void)
+ {
+@@ -197,6 +231,8 @@ sweet_keys_init(void)
+ #define LK_PON_RT       0x0810u         /* bit 0 KPDPWR, bit 1 RESIN */
+ #define LK_VUP_PPID     0x2c6u          /* SID 2, peripheral 0xc6 = GPIO 7 */
+ #define LK_VUP_RT       0xc610u         /* bit 0 input level */
++#define LK_RTC_PPID     0x060u          /* SID 0, peripheral 0x60: RTC_RW */
++#define LK_RTC_READ     0x6048u         /* 32-bit seconds, little endian */
+ 
+ static vm_offset_t lk_core, lk_pon, lk_vup;
+ static uint32_t lk_last_status;
+@@ -293,6 +329,40 @@ keys_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++/*
++ * The PM660 RTC is a free-running seconds counter that nothing on lake sets
++ * to real time (Android and Linux keep an offset elsewhere). Boot-arg
++ * lakertcoff=N (real Unix time minus the RTC count, measured once from
++ * Linux) turns it into the calendar time, set before launchd starts.
++ */
++static void
++lk_set_calendar(void)
++{
++	uint32_t off = 0;
++	uint8_t b[4], again;
++
++	if (!PE_parse_boot_argn("lakertcoff", &off, sizeof(off)) || off == 0) {
++		return;
++	}
++	vm_offset_t rtc = lk_channel(LK_RTC_PPID);
++	for (int i = 0; i < 4; i++) {
++		if (!lk_read(rtc, (uint16_t)(LK_RTC_READ + i), &b[i])) {
++			printf("LAKE RTC: read failed (arb-status %#x)\n", lk_last_status);
++			return;
++		}
++	}
++	/* A carry between the byte reads: read the upper bytes again */
++	if (lk_read(rtc, LK_RTC_READ, &again) && again < b[0]) {
++		b[0] = again;
++		for (int i = 1; i < 4; i++) {
++			(void)lk_read(rtc, (uint16_t)(LK_RTC_READ + i), &b[i]);
++		}
++	}
++	uint32_t raw = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++	clock_set_calendar_microtime((clock_sec_t)raw + off, 0);
++	printf("LAKE RTC: count %u + offset %u = %llu\n", raw, off, (uint64_t)raw + off);
++}
++
+ void
+ sweet_keys_init(void)
+ {
+@@ -312,6 +382,7 @@ sweet_keys_init(void)
+ 		printf("LAKE KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
++	lk_set_calendar();
+ 	lk_pon = lk_channel(LK_PON_PPID);
+ 	lk_vup = lk_channel(LK_VUP_PPID);
+ 	uint8_t pon = 0, vup = 0;
